@@ -1,69 +1,46 @@
 import asyncio
-import logging
-from pathlib import Path
-from typing import List, Dict
-from swarm_aggregator import SwarmAggregator
+import aiohttp
+import json
+import hashlib
+import time
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class DistributedMetadataHarvester:
+    def __init__(self, swarm_peers):
+        self.swarm_peers = swarm_peers
+        self.metadata_index = {}
 
-class GitLensAI:
-    def __init__(self, repos_path: str):
-        self.repos_path = Path(repos_path)
-        self.aggregator = SwarmAggregator()
-        self.batch_size = 5  # Number of repos to process in parallel
+    async def crawl_metadata(self, url):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                metadata = await response.json()
+                metadata_hash = hashlib.sha256(json.dumps(metadata).encode()).hexdigest()
+                self.metadata_index[metadata_hash] = metadata
+                await self.distribute_metadata(metadata_hash, metadata)
 
-    async def analyze_repository(self, repo_path: Path) -> Dict:
-        """Analyze a single repository asynchronously"""
-        try:
-            logger.info(f'Analyzing repository: {repo_path}')
-            stats = await self.aggregator.process_repository(repo_path)
-            return {'path': repo_path, 'stats': stats, 'status': 'success'}
-        except Exception as e:
-            logger.error(f'Error analyzing {repo_path}: {str(e)}')
-            return {'path': repo_path, 'error': str(e), 'status': 'failed'}
+    async def distribute_metadata(self, metadata_hash, metadata):
+        tasks = []
+        for peer in self.swarm_peers:
+            tasks.append(self.send_to_peer(peer, metadata_hash, metadata))
+        await asyncio.gather(*tasks)
 
-    async def process_batch(self, repos: List[Path]):
-        """Process a batch of repositories in parallel"""
-        tasks = [self.analyze_repository(repo) for repo in repos]
-        return await asyncio.gather(*tasks)
+    async def send_to_peer(self, peer, metadata_hash, metadata):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{peer}/metadata", json={"hash": metadata_hash, "data": metadata}) as response:
+                print(f"Sent metadata to {peer}: {response.status}")
 
-    async def analyze_all(self) -> List[Dict]:
-        """Analyze all repositories in the specified directory"""
-        all_repos = list(self.repos_path.glob('*/.git/..'))
+    async def search_metadata(self, query):
         results = []
-
-        for i in range(0, len(all_repos), self.batch_size):
-            batch = all_repos[i:i + self.batch_size]
-            batch_results = await self.process_batch(batch)
-            results.extend(batch_results)
-
+        for metadata in self.metadata_index.values():
+            if query.lower() in json.dumps(metadata).lower():
+                results.append(metadata)
         return results
 
-    def generate_report(self, results: List[Dict]):
-        """Generate a summary report from analysis results"""
-        successful = [r for r in results if r['status'] == 'success']
-        failed = [r for r in results if r['status'] == 'failed']
+async def main():
+    swarm_peers = ["http://peer1.example.com", "http://peer2.example.com", "http://peer3.example.com"]
+    harvester = DistributedMetadataHarvester(swarm_peers)
+    await harvester.crawl_metadata("https://api.example.com/metadata")
+    search_results = await harvester.search_metadata("important")
+    print(search_results)
 
-        logger.info(f'Analysis complete:')
-        logger.info(f'Processed {len(results)} repositories')
-        logger.info(f'Successful: {len(successful)}')
-        logger.info(f'Failed: {len(failed)}')
-
-        if failed:
-            logger.warning('Failed repositories:')
-            for repo in failed:
-                logger.warning(f"{repo['path']}: {repo['error']}")
-
-def main():
-    repos_dir = './repositories'
-    analyzer = GitLensAI(repos_dir)
-    
-    async def run_analysis():
-        results = await analyzer.analyze_all()
-        analyzer.generate_report(results)
-
-    asyncio.run(run_analysis())
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())

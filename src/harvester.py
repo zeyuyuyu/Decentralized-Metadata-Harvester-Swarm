@@ -1,42 +1,22 @@
-import asyncio
-import aiohttp
+import requests
 import json
 from typing import List, Dict
 
-class DistributedHarvester:
-    def __init__(self, swarm_peers: List[str], timeout: int = 10):
-        self.swarm_peers = swarm_peers
-        self.timeout = timeout
+class MetadataHarvester:
+    def __init__(self, chains: List[str]):
+        self.chains = chains
         self.metadata_cache: Dict[str, Dict] = {}
 
-    async def harvest_metadata(self, url: str) -> Dict:
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for peer in self.swarm_peers:
-                task = asyncio.create_task(self.harvest_from_peer(session, peer, url))
-                tasks.append(task)
-            results = await asyncio.gather(*tasks)
-            merged_metadata = self.merge_metadata(results)
-            self.metadata_cache[url] = merged_metadata
-            return merged_metadata
+    def harvest_metadata(self, contract_address: str) -> Dict:
+        metadata = {}
+        for chain in self.chains:
+            if chain not in self.metadata_cache:
+                self.metadata_cache[chain] = self._fetch_metadata(contract_address, chain)
+            metadata[chain] = self.metadata_cache[chain]
+        return metadata
 
-    async def harvest_from_peer(self, session: aiohttp.ClientSession, peer: str, url: str) -> Dict:
-        try:
-            async with session.get(f'{peer}/metadata?url={url}', timeout=self.timeout) as response:
-                data = await response.json()
-                return data
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            return {}
-
-    def merge_metadata(self, metadata_lists: List[Dict]) -> Dict:
-        merged = {}
-        for metadata in metadata_lists:
-            for key, value in metadata.items():
-                if key not in merged:
-                    merged[key] = value
-                else:
-                    if isinstance(merged[key], list):
-                        merged[key].extend(value)
-                    else:
-                        merged[key] = [merged[key], value]
-        return merged
+    def _fetch_metadata(self, contract_address: str, chain: str) -> Dict:
+        url = f'https://api.{chain}.com/metadata/{contract_address}'
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()

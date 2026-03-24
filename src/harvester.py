@@ -1,41 +1,42 @@
-import requests
-import hashlib
-import time
-from typing import List, Tuple
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import aiohttp
+import json
+from typing import List, Dict
 
 class DistributedHarvester:
-    def __init__(self, worker_count: int = 8, deduplication_threshold: int = 3):
-        self.worker_count = worker_count
-        self.deduplication_threshold = deduplication_threshold
-        self.crawl_queue = []
-        self.crawled_urls = set()
-        self.deduplication_cache = {}
+    def __init__(self, swarm_peers: List[str], timeout: int = 10):
+        self.swarm_peers = swarm_peers
+        self.timeout = timeout
+        self.metadata_cache: Dict[str, Dict] = {}
 
-    def add_url(self, url: str):
-        self.crawl_queue.append(url)
+    async def harvest_metadata(self, url: str) -> Dict:
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for peer in self.swarm_peers:
+                task = asyncio.create_task(self.harvest_from_peer(session, peer, url))
+                tasks.append(task)
+            results = await asyncio.gather(*tasks)
+            merged_metadata = self.merge_metadata(results)
+            self.metadata_cache[url] = merged_metadata
+            return merged_metadata
 
-    def _deduplicate(self, url: str) -> bool:
-        url_hash = hashlib.md5(url.encode()).hexdigest()
-        if url_hash in self.deduplication_cache:
-            self.deduplication_cache[url_hash] += 1
-            return self.deduplication_cache[url_hash] >= self.deduplication_threshold
-        else:
-            self.deduplication_cache[url_hash] = 1
-            return False
+    async def harvest_from_peer(self, session: aiohttp.ClientSession, peer: str, url: str) -> Dict:
+        try:
+            async with session.get(f'{peer}/metadata?url={url}', timeout=self.timeout) as response:
+                data = await response.json()
+                return data
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return {}
 
-    def _crawl(self, url: str) -> Tuple[str, str]:
-        response = requests.get(url)
-        content = response.text
-        return url, content
-
-    def run(self):
-        with ThreadPoolExecutor(max_workers=self.worker_count) as executor:
-            while self.crawl_queue:
-                url = self.crawl_queue.pop(0)
-                if url not in self.crawled_urls and not self._deduplicate(url):
-                    self.crawled_urls.add(url)
-                    future = executor.submit(self._crawl, url)
-                    url, content = future.result()
-                    yield url, content
-                time.sleep(0.1)
+    def merge_metadata(self, metadata_lists: List[Dict]) -> Dict:
+        merged = {}
+        for metadata in metadata_lists:
+            for key, value in metadata.items():
+                if key not in merged:
+                    merged[key] = value
+                else:
+                    if isinstance(merged[key], list):
+                        merged[key].extend(value)
+                    else:
+                        merged[key] = [merged[key], value]
+        return merged

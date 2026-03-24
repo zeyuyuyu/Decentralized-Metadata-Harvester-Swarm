@@ -1,93 +1,41 @@
-import asyncio
-import aiohttp
-from typing import List, Dict, Optional
-from dataclasses import dataclass
+import requests
+import hashlib
 import time
-import logging
-from aiohttp import ClientSession
-from ratelimit import limits, sleep_and_retry
-
-@dataclass
-class CrawlResult:
-    url: str
-    metadata: Dict
-    timestamp: float
-    status: int
-    error: Optional[str] = None
+from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 class DistributedHarvester:
-    def __init__(self, concurrency: int = 5, rate_limit: int = 30):
-        self.concurrency = concurrency
-        self.rate_limit = rate_limit
-        self.session: Optional[ClientSession] = None
-        self.results: List[CrawlResult] = []
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, worker_count: int = 8, deduplication_threshold: int = 3):
+        self.worker_count = worker_count
+        self.deduplication_threshold = deduplication_threshold
+        self.crawl_queue = []
+        self.crawled_urls = set()
+        self.deduplication_cache = {}
 
-    @sleep_and_retry
-    @limits(calls=30, period=60)
-    async def _fetch_url(self, url: str) -> CrawlResult:
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+    def add_url(self, url: str):
+        self.crawl_queue.append(url)
 
-        try:
-            start_time = time.time()
-            async with self.session.get(url) as response:
-                metadata = {
-                    'headers': dict(response.headers),
-                    'content_type': response.headers.get('content-type'),
-                    'size': len(await response.read()),
-                    'status': response.status
-                }
-                return CrawlResult(
-                    url=url,
-                    metadata=metadata,
-                    timestamp=start_time,
-                    status=response.status
-                )
+    def _deduplicate(self, url: str) -> bool:
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        if url_hash in self.deduplication_cache:
+            self.deduplication_cache[url_hash] += 1
+            return self.deduplication_cache[url_hash] >= self.deduplication_threshold
+        else:
+            self.deduplication_cache[url_hash] = 1
+            return False
 
-        except Exception as e:
-            self.logger.error(f'Error crawling {url}: {str(e)}')
-            return CrawlResult(
-                url=url,
-                metadata={},
-                timestamp=time.time(),
-                status=0,
-                error=str(e)
-            )
+    def _crawl(self, url: str) -> Tuple[str, str]:
+        response = requests.get(url)
+        content = response.text
+        return url, content
 
-    async def process_urls(self, urls: List[str]) -> List[CrawlResult]:
-        tasks = []
-        for url in urls:
-            task = asyncio.ensure_future(self._fetch_url(url))
-            tasks.append(task)
-
-        results = []
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
-            if result.error:
-                self.logger.warning(f'Failed to process {result.url}: {result.error}')
-            else:
-                self.logger.info(f'Successfully processed {result.url}')
-
-        return results
-
-    async def harvest(self, urls: List[str], chunk_size: Optional[int] = None) -> List[CrawlResult]:
-        if chunk_size is None:
-            chunk_size = self.concurrency * 2
-
-        all_results = []
-        for i in range(0, len(urls), chunk_size):
-            chunk = urls[i:i + chunk_size]
-            results = await self.process_urls(chunk)
-            all_results.extend(results)
-
-        if self.session:
-            await self.session.close()
-
-        return all_results
-
-    @classmethod
-    async def create_and_harvest(cls, urls: List[str], **kwargs) -> List[CrawlResult]:
-        harvester = cls(**kwargs)
-        return await harvester.harvest(urls)
+    def run(self):
+        with ThreadPoolExecutor(max_workers=self.worker_count) as executor:
+            while self.crawl_queue:
+                url = self.crawl_queue.pop(0)
+                if url not in self.crawled_urls and not self._deduplicate(url):
+                    self.crawled_urls.add(url)
+                    future = executor.submit(self._crawl, url)
+                    url, content = future.result()
+                    yield url, content
+                time.sleep(0.1)
